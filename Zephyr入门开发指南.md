@@ -330,20 +330,28 @@ my-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
 - `13` → 引脚号
 - `GPIO_ACTIVE_LOW` → 电平极性，定义在 `dt-bindings/gpio/gpio.h`
 
-**如何找到 GPIO 控制器名：**
+**如何找到 GPIO 控制器名（以 STM32 为例）：**
 
 ```bash
 grep -r "gpio@" dts/arm/st/f4/stm32f405.dtsi
 # 输出类似：
 # gpio_a: gpio@40020000 { ... };
 # gpio_b: gpio@40020400 { ... };
-# ...
 ```
 
-### Pinctrl 节点
+> 🎯 **换成你的芯片怎么办？** 把架构和厂商路径换成你的：
+> ```bash
+> # 确定你的芯片架构
+> ls dts/<架构>/<厂商>/
+> # 在对应的 SoC dtsi 里搜 gpio@
+> grep "gpio@" dts/<架构>/<厂商>/<你的芯片>.dtsi
+> ```
 
-引脚复用配置，通常在板级 pinctrl dtsi 文件中：
+### Pinctrl 节点——不同芯片写法不同
 
+Pinctrl（引脚复用）的定义方式**因芯片厂商而异**，不是统一的写法。
+
+**STM32 风格：** 使用 `psels` 属性 + `STM32_PSEL_xxx` 宏
 ```devicetree
 &pinctrl {
     uart0_default: uart0_default {
@@ -354,13 +362,39 @@ grep -r "gpio@" dts/arm/st/f4/stm32f405.dtsi
 };
 ```
 
-`STM32_PSEL_xxx` 宏定义位置：
+**NXP i.MX RT 风格：** 使用 `group` + 引脚名直接指定
+```devicetree
+&iomuxc {
+    pinctrl_uart1: uart1grp {
+        fsl,pins = <
+            MXRT_PAD_GPIO_AD_B0_12__UART1_TXD 0x1e0
+            MXRT_PAD_GPIO_AD_B0_13__UART1_RXD 0x1e0
+        >;
+    };
+};
+```
 
+**Nordic nRF 风格：** 直接在设备树外设节点中配引脚
+```devicetree
+&uart0 {
+    tx-pin = <6>;   rx-pin = <8>;
+    rts-pin = <5>;  cts-pin = <7>;
+};
+```
+
+> 💡 **怎么查你的芯片用哪种写法？**
+> ```bash
+> # 找一个你芯片的官方板子，看它的 .dts 里 pinctrl 怎么写
+> cat boards/<厂商>/<板名>/*.dts | grep -A5 "pinctrl"
+> # 或者搜芯片 pinctrl 头文件
+> ls include/zephyr/dt-bindings/pinctrl/
+> ```
+
+Pinctrl 宏定义位置：
 ```
 zephyr/include/zephyr/dt-bindings/pinctrl/<芯片系列>.h
 ```
-
-例如 STM32 系列是 `stm32f4-pinctrl.h` 或 `stm32-common-pinctrl.h`。
+例如 STM32 系列是 `stm32f4-pinctrl.h`，NXP 是 `imxrt-pinctrl.h`。
 
 ## 2.6 设备树调试三板斧
 
@@ -378,8 +412,6 @@ DT_ALIAS(led0)       # 在脑子里展开，或用编译后的头文件确认
 ```
 
 ## 2.7 STM32 设备树注意事项
-
-如果你是 STM32 用户，有两点特别容易踩坑：
 
 ### 时钟配置——不同芯片家族的做法
 
@@ -663,11 +695,14 @@ cat zephyr/samples/sensor/bme280/prj.conf
 cat build/zephyr/.config | grep -E "(I2C|UART|SHELL)" | head -20
 ```
 
-## 4.3 完整追踪示例：一个参数的生命周期
+## 4.3 完整追踪示例：如何追踪任意芯片的驱动名
 
-### 案例：`CONFIG_I2C_STM32=y` 从哪来？
+方法是一样的，方法 2 的 grep 换成你的芯片名搜就行：
 
 ```bash
+# 以 STM32 的 I2C 驱动为例：
+# 想知道 CONFIG_I2C_STM32 从哪来？
+
 # Step 1：搜定义
 grep -r "config I2C_STM32" zephyr/ --include="Kconfig*"
 # 结果在：zephyr/drivers/i2c/Kconfig.stm32
@@ -687,6 +722,14 @@ CONFIG_I2C=y
 CONFIG_I2C_STM32=y
 ```
 
+> 💡 **换一个芯片也是一样的流程：**
+> ```bash
+> # 比如你是 NXP i.MX RT，搜 I2C 对应的 Kconfig
+> grep -r "config I2C" zephyr/drivers/i2c/ --include="Kconfig*" | grep -i "imx\\|nxp"
+> # → CONFIG_I2C_MCUX=y（MCUXpresso SDK 的 I2C 驱动）
+> # → prj.conf 里写 CONFIG_I2C=y CONFIG_I2C_MCUX=y
+> ```
+
 ## 4.4 常用参数分类速查
 
 ### 驱动使能（先开框架，再开具体驱动）
@@ -701,13 +744,28 @@ CONFIG_SENSOR=y        # 传感器子系统框架
 CONFIG_SERIAL=y        # 串口子系统框架
 ```
 
-### 具体驱动（框架之上的具体芯片驱动）
+### 具体驱动——不同芯片的驱动名不同
 
+**不要照抄 STM32 的名字。** 用同样的方法找你芯片的选项：
+
+| 你的芯片 | GPIO 驱动名 | I2C 驱动名 |
+|---------|------------|-----------|
+| STM32 | `CONFIG_GPIO_STM32=y` | `CONFIG_I2C_STM32=y` |
+| NXP i.MX RT | `CONFIG_GPIO_MCUX_IGPIO=y` | `CONFIG_I2C_MCUX=y` |
+| Nordic nRF | `CONFIG_GPIO_NRF=y` | `CONFIG_I2C_NRF_TWIM=y` |
+| ESP32 | `CONFIG_GPIO_ESP32=y` | `CONFIG_I2C_ESP32=y` |
+
+> 🎯 **不确定你的芯片驱动叫什么？**
+> ```bash
+> # 找 GPIO 驱动：grep -r "config GPIO" zephyr/drivers/gpio/ --include="Kconfig*" | grep -i "你的芯片"
+> # 找 I2C 驱动：grep -r "config I2C" zephyr/drivers/i2c/ --include="Kconfig*" | grep -i "你的芯片"
+> # 或者看官方板子的 defconfig
+> cat boards/<厂商>/<板名>/*_defconfig | grep -E "(GPIO|I2C|SPI)"
+> ```
+
+传感器驱动是跨芯片的（走总线），各芯片通用：
 ```
-CONFIG_GPIO_STM32=y             # STM32 GPIO 驱动
-CONFIG_I2C_STM32=y              # STM32 I2C 驱动
 CONFIG_SENSOR_BME280=y          # BME280 传感器驱动
-CONFIG_ADC_STM32=y              # STM32 ADC 驱动
 ```
 
 ### 系统功能
@@ -949,14 +1007,15 @@ myboard/
 
 ## 6.3 Board DTS——板级设备树怎么写？
 
-这是**最重要的文件**——它是板子的"身份证明"。
+> ⚠️ **以下示例基于 STM32。** 不同芯片的 `#include` 路径、外设节点名、pinctrl 写法都不同，不要照抄。关键是理解**结构**，具体名称以你芯片的 `.dtsi` 为准。
 
-### Board DTS 的标准结构
+### Board DTS 的标准结构（以 STM32 为例）
 
 ```devicetree
 /* boards/<arch>/<vendor>/<board>.dts */
 
-/* 1. 包含 SoC 级设备树（含有所有片上外设定义） */
+/* 1. 包含 SoC 级设备树（含有所有片上外设定义）*/
+/* ★ 换成你的芯片路径：看同系列官方板子的 #include */
 #include <st/f4/stm32f411Xe.dtsi>
 /* 2. 包含芯片系列共有的 pinctrl 定义 */
 #include <st/f4/stm32f4-pinctrl.dtsi>
@@ -1011,6 +1070,15 @@ myboard/
 };
 ```
 
+> 🎯 **换成你的芯片，怎么知道 #include 什么？**
+> ```bash
+> # 先确定你的芯片在 zephyr/dts 下的路径
+> find zephyr/dts -name "*你的芯片*.dtsi"
+> # 例如：zephyr/dts/arm/nxp/nxp_rt1050.dtsi
+> # 然后看同系列官方板子的 .dts 文件开头
+> head -10 boards/<厂商>/<板名>/*.dts
+> ```
+
 ### Board DTS 核心要素
 
 | 组成部分 | 作用 | 必须？ | 参考来源 |
@@ -1032,7 +1100,7 @@ compatible = "st,stm32f411re-nucleo", "st,stm32f411";
 
 > 📚 **参考来源：** 找跟你 MCU 最像的官方板子直接复制改
 > ```bash
-> find boards/ -name "*.dts" | xargs grep -l "stm32f411"
+> find boards/ -name "*.dts" | xargs grep -l "你的芯片型号"
 > ```
 
 ## 6.4 Board YAML——板子元数据
@@ -1061,7 +1129,7 @@ features:
 ```
 
 > 💡 **不确定参数值？**
-> - `arch` → 看你 MCU 的内核架构（Cortex-M → arm）
+> - `arch` → 看你 MCU 的内核架构（Cortex-M → arm，RISC-V → riscv）
 > - `rom_size` / `ram_size` → datasheet 里 Flash/SRAM 大小
 > - 不知道就找一个同系列官方板子的 yaml 直接抄
 
@@ -1071,6 +1139,7 @@ features:
 
 ```bash
 # boards/<arch>/<vendor>/<board>_defconfig
+# ★ 以下为 STM32 示例，换成你的芯片对应的 CONFIG_SOC_xxx
 CONFIG_SOC_STM32F411XE=y         # SoC 型号
 CONFIG_SOC_SERIES_STM32F4X=y    # SoC 系列
 CONFIG_ARM=y                     # 架构
@@ -1082,9 +1151,8 @@ CONFIG_PRINTK=y
 
 > 🎯 **如何找到正确的 CONFIG_SOC_xxx？**
 > ```bash
-> grep -r "SOC_STM32F411XE" zephyr/ --include="Kconfig*"
-> # → arch/arm/soc/st_stm32/stm32f4/Kconfig.series
-> # 或者直接看官方板子的 defconfig
+> grep -r "SOC_你的芯片型号" zephyr/ --include="Kconfig*"
+> # 或者看同系列官方板子的 defconfig
 > ```
 
 ### Kconfig.defconfig（推荐）
@@ -1113,18 +1181,19 @@ endif # SOC_STM32F411XE
 
 ```cmake
 # boards/<arch>/<vendor>/board.cmake
-board_runner_args(stlink --stlink-cmd-opt="--connect-under-reset")
-board_runner_args(pyocd --target stm32f411xe)
+# ★ 以下为示例，换成你的调试器参数
+board_runner_args(stlink --stlink-cmd-opt="--connect-under-reset")    # ST-Link
+board_runner_args(pyocd --target stm32f411xe)                         # pyOCD
 
 include(${ZEPHYR_BASE}/boards/common/stlink.board.cmake)
 include(${ZEPHYR_BASE}/boards/common/pyocd.board.cmake)
 ```
 
-> 🔍 **如何知道调试器用哪个 runner？**
+> 🔍 **如何确定调试器和 runner？**
 > ```bash
-> west flash -h   # 看支持哪些 runner
-> # 常用：stlink, jlink, openocd, pyocd, dfu-util
-> # 找一个跟你调试器一样的官方板子，抄它的 board.cmake
+> # 常用 runner：stlink（STM32）、jlink（通用）、pyocd（通用）、openocd（通用）、dfu-util（USB）
+> west flash -h
+> # 找跟你调试器一样的官方板子，抄它的 board.cmake
 > ```
 
 ## 6.7 实战：最快的起步方法——复制并修改
@@ -1132,8 +1201,12 @@ include(${ZEPHYR_BASE}/boards/common/pyocd.board.cmake)
 ### Step 1：找参考板
 
 ```bash
-# 你用的是 STM32F411 → 找所有用 f411 的板子
+# 找跟你的 MCU 同型号的官方板子
+find boards/<架构>/ -name "*.dts" | xargs grep -l "你的芯片型号"
+
+# 举例：你用的是 STM32F411
 find boards/arm/ -name "*.dts" | xargs grep -l "stm32f411"
+# → nucleo_f411re, blackpill_f411ce 等
 ```
 
 ### Step 2：复制整个目录
@@ -1202,8 +1275,8 @@ west build -b myboard samples/hello_world
 | 不知道支持哪些 flash runner | `boards/common/*.board.cmake` |
 | 编译报错 `board not found` | 确认 board yaml 的 identifier 名正确 |
 | uart 不工作 | 查板子 UART 引脚和 pinctrl 配置 |
-| 想知道某 SoC 系列有哪些板子 | `find boards/ -name "*.dts" | xargs grep -l "stm32f4"` |
-| 想知道 dtsi 里定义了哪些节点 | `grep "^/ {" -A 200 zephyr/dts/arm/st/f4/stm32f411.dtsi` |
+| 想知道某 SoC 系列有哪些板子 | `find boards/ -name "*.dts" | xargs grep -l "你的芯片"` |
+| 想知道 dtsi 里定义了哪些节点 | `grep "^/ {" -A 200 zephyr/dts/<架构>/<厂商>/你的芯片.dtsi` |
 | 板子启动就 panic | 检查 chosen 里的 console/uart 引脚对不对 |
 
 ## 6.9 把自定义板子放进应用目录（不修改 Zephyr 源码）
@@ -1476,10 +1549,12 @@ west build -v                     # verbose 输出
 west build -t monitor             # 串口监控
 west flash                        # 烧录
 
-# === STM32 特有 ===
-west flash --runner stlink        # 强制使用 ST-Link
-west flash --runner openocd       # 使用 OpenOCD
-STM32_Programmer_CLI -c port=SWD -w build/zephyr/zephyr.bin 0x08000000
+# === 指定烧录 runner（按你的调试器选） ===
+west flash --runner stlink        # ST-Link（STM32）
+west flash --runner jlink         # J-Link（通用）
+west flash --runner pyocd         # pyOCD（通用）
+west flash --runner openocd       # OpenOCD（通用）
+west flash --runner dfu-util      # DFU（通用）
 
 # === 查看生成的宏 ===
 cat build/zephyr/include/generated/devicetree_generated.h | head -50
@@ -1493,7 +1568,7 @@ cat build/zephyr/include/generated/devicetree_generated.h | head -50
   ├─ CONFIG_xxx = y？
   ├─ device_is_ready() 检查了？
   ├─ pinctrl 引脚配对了？
-  └─ 🎯 STM32：检查 RCC 时钟配置
+  └─ 🎯 时钟配置是否正确？（设备树路线看 dts，Kconfig 路线看 .config）
 
 问题：找不到 CONFIG 选项
   ├─ menuconfig 搜索（west build -t menuconfig，按 /）
