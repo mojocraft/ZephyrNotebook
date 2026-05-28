@@ -1634,6 +1634,554 @@ dts/chosen/alias → 设备获取三板斧。
 编译先用west build -t devicetree → 有问题早暴露。
 ```
 
+# 第八章：调试与测试——让 Bug 无处可藏
+
+> 前面学了怎么写代码，这一章学怎么让代码**跑对了**。
+
+## 8.1 串口日志——最朴素的调试手段
+
+### 日志级别
+
+```c
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(my_module, LOG_LEVEL_DBG);
+// 或分文件注册:
+// LOG_MODULE_DECLARE(my_module, LOG_LEVEL_DBG);
+
+LOG_ERR("Something broke: %d", ret);   // 0 - 最高优先级
+LOG_WRN("Warning: %d", val);            // 1
+LOG_INF("Initialized OK");              // 2
+LOG_DBG("reg=0x%02x, val=%d", reg, v);  // 3 - 调试用
+```
+
+**prj.conf 控制日志输出：**
+
+```
+CONFIG_LOG=y
+CONFIG_LOG_DEFAULT_LEVEL=3          # 默认日志级别
+CONFIG_LOG_BACKEND_SHOW_COLOR=y     # ✅ 彩色输出，直观区分 ERR/WRN/INF
+CONFIG_LOG_BACKEND_FORMAT_TIMESTAMP=y
+CONFIG_LOG_PROCESS_THREAD_STARTUP_DELAY_MS=1000  # 等串口准备好再打日志
+```
+
+**日志 vs printk 选择：**
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+|------|------|------|---------|
+| `LOG_INF/ERR/DBG` | 分级、可开关、时间戳 | 需要 LOG 子系统 | 日常开发首选 |
+| `printk` | 最简单、不依赖 LOG | 不能分级 | 临时调试、基本输出 |
+| `printf` | 标准 C | 栈开销大，默认不可用 | 不推荐在 Zephyr 中用 |
+
+### 日志超时导致的问题
+
+```c
+// ❌ 如果你在中断或极短时间片里疯狂打日志：
+for (int i = 0; i < 10000; i++) {
+    LOG_DBG("iteration %d", i);
+}
+// → 日志线程来不及处理 → 丢日志 / 看门狗复位
+
+// ✅ 解决：降低级别或用频率限制
+if (i % 100 == 0) LOG_DBG("iteration %d", i);
+```
+
+## 8.2 Shell 交互调试
+
+在生产板子上接不了调试器时，Shell 是你最好的朋友。
+
+### 启用 Shell
+
+```
+# prj.conf
+CONFIG_SHELL=y
+CONFIG_SHELL_BACKEND_SERIAL=y       # 串口 Shell
+CONFIG_SHELL_CMD_BUFFER_SIZE=256    # 命令缓冲区
+CONFIG_SHELL_HISTORY=16             # 历史记录
+```
+
+### 常用内置命令
+
+```bash
+# 查看内核对象
+uart:~$ kernel threads         # 列出所有线程
+uart:~$ kernel stacks          # 查看栈使用率
+uart:~$ kernel uptime          # 运行时间
+
+# 查看设备
+uart:~$ device list            # 列出所有设备及其状态（ready/not ready）
+
+# 内存信息
+uart:~$ kernel heap
+
+# 历史命令
+uart:~$ history
+```
+
+### 自定义 Shell 命令
+
+```c
+#include <zephyr/shell/shell.h>
+
+/* 定义一个简单的 read-sensor 命令 */
+static int cmd_read_sensor(const struct shell *sh,
+                           size_t argc, char **argv)
+{
+    float temp, hum;
+    if (sensor_read(&temp, &hum) == 0) {
+        shell_print(sh, "Temperature: %.1f C", temp);
+        shell_print(sh, "Humidity: %.1f %%", hum);
+    } else {
+        shell_error(sh, "Sensor read failed!");
+    }
+    return 0;
+}
+
+/* 注册命令 */
+SHELL_CMD_REGISTER(read_sensor, NULL, "Read sensor values", cmd_read_sensor);
+
+/* 带子命令的形式：*/
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_sensor,
+    SHELL_CMD(init, NULL, "Initialize sensor", cmd_init),
+    SHELL_CMD(read, NULL, "Read sensor values", cmd_read),
+    SHELL_CMD(reset, NULL, "Reset sensor", cmd_reset),
+    SHELL_SUBCMD_SET_END
+);
+SHELL_CMD_REGISTER(sensor, &sub_sensor, "Sensor commands", NULL);
+```
+
+## 8.3 GDB 调试
+
+### 启动调试会话
+
+```bash
+# 方法 1：一步到位
+west debug
+
+# 方法 2：先烧录再手动接 GDB
+west flash
+west debugserver       # 启动 GDB Server（另一终端）
+# 然后在原终端：
+arm-zephyr-eabi-gdb build/zephyr/zephyr.elf
+(gdb) target remote :3333
+```
+
+### 调试常用命令
+
+```gdb
+# 打断点
+(gdb) break main                           # 函数入口
+(gdb) break src/main.c:42                  # 文件行号
+(gdb) break gpio_pin_set                   # 函数名
+(gdb) break *0x08001000                    # 地址
+
+# 运行控制
+(gdb) continue        # 继续运行
+(gdb) step            # 单步进入
+(gdb) next            # 单步跳过
+(gdb) finish          # 跑完当前函数
+
+# 查看数据
+(gdb) print var_name
+(gdb) print/x reg_addr                     # 16 进制
+(gdb) info registers
+(gdb) monitor reset halt                   # 复位并暂停
+
+# 查看栈回溯
+(gdb) backtrace
+(gdb) bt full          # 带局部变量
+```
+
+### 调试 HardFault（重中之重！）
+
+当程序跑飞进入 HardFault，不要慌，按以下步骤定位：
+
+```gdb
+(gdb) backtrace
+# 看最后调用的函数
+(gdb) info registers
+# 看 LR（链接寄存器）和 PC（程序计数器）
+(gdb) x/10x $sp       # 查看栈内容
+
+# 常见 HardFault 原因：
+# 1. 空指针解引用 → 检查哪个指针是 0x0
+# 2. 栈溢出 → 检查线程栈大小
+# 3. 数组越界 → 检查循环边界
+# 4. 外设未初始化就访问 → 检查 device_is_ready()
+```
+
+## 8.4 ztest——给嵌入式代码写单元测试
+
+Zephyr 内置了 `ztest` 测试框架，让你能在开发板上跑单元测试。
+
+### 最小的测试项目
+
+```
+# my_test/
+# ├── CMakeLists.txt
+# ├── testcase.yaml
+# └── src/
+#     └── main.c
+```
+
+```c
+// src/main.c
+#include <zephyr/ztest.h>
+
+/* 要测试的代码 */
+static int add(int a, int b) { return a + b; }
+
+/* 测试用例 */
+ZTEST(my_test_suite, test_add_basic)
+{
+    zassert_equal(add(1, 2), 3, "1 + 2 should be 3");
+    zassert_equal(add(-1, 1), 0, "-1 + 1 should be 0");
+}
+
+ZTEST(my_test_suite, test_add_overflow)
+{
+    /* 验证边界情况 */
+    zassert_not_equal(add(0x7FFFFFFF, 1), 0x7FFFFFFF,
+                      "Overflow should change value");
+}
+
+/* 套件初始化 */
+static void *my_test_setup(void)
+{
+    /* 在这里初始化硬件或模拟，如果不需要就 return NULL */
+    return NULL;
+}
+
+ZTEST_SUITE(my_test_suite, NULL, my_test_setup, NULL, NULL, NULL);
+```
+
+```cmake
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(my_test)
+
+FILE(GLOB sources src/*.c)
+target_sources(app PRIVATE ${sources})
+```
+
+```yaml
+# testcase.yaml
+tests:
+  my_test:
+    platform_allow: native_posix qemu_cortex_m3
+    tags: test
+```
+
+### 运行测试
+
+```bash
+# 在 QEMU 上跑（不需要硬件）
+west build -b qemu_cortex_m3 .
+west build -t run
+
+# 在开发板上跑
+west build -b nucleo_f411re .
+west flash
+```
+
+### 测试硬件相关代码的技巧
+
+测试 I2C/SPI 设备时，适合用 **native_posix** 或者 **qemu** 配合 mocked 驱动：
+
+```c
+/* 在 native_posix 上，外设驱动可以被模拟 */
+#include <zephyr/drivers/emul.h>
+
+/* 创建一个模拟 I2C 设备 */
+const struct emul *emul = emul_get_binding(DT_NODELABEL(my_i2c_dev));
+
+/* 手动注入传感器返回值 */
+struct i2c_msg fake_data = {
+    .buf = (uint8_t[]){0x1C, 0x33, 0x00, 0x00, 0x00, 0x00},
+    .len = 6,
+};
+```
+
+## 8.5 断言——尽早暴露问题
+
+```
+CONFIG_ASSERT=y              # 启用断言
+CONFIG_ASSERT_ALWAYS_ON=y    # release 构建也保留
+```
+
+```c
+#include <zephyr/sys/__assert.h>
+
+void my_function(void *ptr)
+{
+    __ASSERT(ptr != NULL, "ptr must not be NULL");
+    __ASSERT_NO_MSG(ptr != NULL);  // 不带消息版
+
+    // 运行时检查（release 构建会被优化掉）
+    __ASSERT(sizeof(struct my_struct) == 32,
+             "struct size mismatch");
+}
+```
+
+> 💡 **断言 vs. 实际检查：**
+> - `__ASSERT` → 开发时找 Bug，release 构建可关闭
+> - `if (ptr == NULL) return -EINVAL;` → 生产代码必须处理的情况
+> - 断言是**契约**，不是**错误处理**
+
+---
+
+# 第九章：实用进阶技巧
+
+## 9.1 设置子系统——断电不丢失的配置
+
+当你的设备需要保存配置（Wi-Fi 密码、校准参数、用户偏好），用 Zephyr 的 Settings 子系统：
+
+### 最小示例
+
+```
+# prj.conf
+CONFIG_SETTINGS=y
+CONFIG_SETTINGS_NVS=y                # 用 NVS（非易失性存储）
+CONFIG_FLASH_MAP=y
+```
+
+```c
+#include <zephyr/settings/settings.h>
+
+/* 定义读取/写入处理函数 */
+static int my_settings_export(int (*cb)(const char *name,
+                                         const void *value,
+                                         size_t len))
+{
+    /* 保存当前设置 */
+    uint32_t calib = 42;
+    cb("myapp/calib", &calib, sizeof(calib));
+    return 0;
+}
+
+static int my_settings_set(const char *key,
+                           size_t len_settings,
+                           settings_read_cb read_cb,
+                           void *cb_arg)
+{
+    if (!strcmp(key, "calib")) {
+        uint32_t val;
+        read_cb(cb_arg, &val, sizeof(val));
+        printk("Loaded calibration: %u\n", val);
+    }
+    return 0;
+}
+
+/* 注册处理函数（在 main 开始部分调用） */
+void init_settings(void)
+{
+    static struct settings_handler my_handler = {
+        .name = "myapp",
+        .h_set = my_settings_set,
+        .h_export = my_settings_export,
+    };
+    settings_register(&my_handler);
+    settings_load();              // 从 flash 加载
+}
+
+/* 运行时保存 */
+void save_calibration(uint32_t val)
+{
+    settings_save_one("myapp/calib", &val, sizeof(val));
+}
+```
+
+## 9.2 电源管理——让你的设备会睡觉
+
+### 使能
+
+```
+CONFIG_PM=y                               # 电源管理框架
+CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=4096    # PM 需要更大的 work queue
+CONFIG_PM_DEVICE=y                         # 外设电源管理
+```
+
+### 让系统进入空闲状态
+
+Zephyr 默认在空闲线程中执行 `WFI`（Wait For Interrupt）指令，不需要额外代码。但你可以控制 **睡眠深度**：
+
+```c
+#include <zephyr/pm/pm.h>
+#include <zephyr/pm/device.h>
+
+/* 主动让系统进入 tickless idle */
+/* （默认就会，以下代码只是在需要时手动控制） */
+
+/* 在外设不再需要时关掉它 */
+void disable_sensor(void)
+{
+    const struct device *dev = DEVICE_DT_GET_ONE(my_sensor);
+    pm_device_action_run(dev, PM_DEVICE_ACTION_SUSPEND);
+}
+
+/* 需要时再唤醒 */
+void enable_sensor(void)
+{
+    const struct device *dev = DEVICE_DT_GET_ONE(my_sensor);
+    pm_device_action_run(dev, PM_DEVICE_ACTION_RESUME);
+}
+```
+
+### 约束与限制
+
+| 状态 | 说明 | 典型功耗 | 唤醒源 |
+|------|------|---------|--------|
+| Active | 正常运行 | 10-100 mA | — |
+| Suspended | 外设时钟关 | 1-10 mA | 中断 |
+| Off | 深度睡眠 | µA 级 | RTC / 外部中断 |
+
+> 💡 **常见坑：**
+> - 如果某个外设没做 `pm_device` 支持，系统可能无法进入深度睡眠
+> - 使用 `pm_state_force()` 可以强制进入某状态（调试用）
+> - 串口 Shell 开着时通常会阻止深度睡眠
+
+## 9.3 模块（Module）系统——给 Zephyr 加料
+
+当你需要引入**不属于 Zephyr 主线**的驱动或库时，用 Module 系统：
+
+### 目录结构
+
+```
+my_module/
+├── CMakeLists.txt          # 库构建
+├── Kconfig                 # Kconfig 选项
+├── zephyr/                 # Zephyr 专用
+│   └── module.yml          # Module 声明文件（必须！）
+├── drivers/                # 可选的驱动
+└── include/
+```
+
+### module.yml
+
+```yaml
+# my_module/zephyr/module.yml
+name: my_module
+build:
+  cmake: .
+  kconfig: Kconfig
+```
+
+### 在应用中引用
+
+```bash
+# 方法 1：west 命令行
+west build -b nucleo_f411re . -DZEPHYR_MODULES=/path/to/my_module
+
+# 方法 2：west 配置文件 ~/.west/config
+[zephyr]
+zephyr_base = /path/to/zephyr
+additional_modules = /path/to/my_module
+```
+
+## 9.4 常用的实用技巧集
+
+### 测量代码执行时间
+
+```c
+#include <zephyr/sys/__assert.h>
+#include <zephyr/timing/timing.h>
+
+timing_t start, end;
+uint64_t cycles, ns;
+
+timing_init();
+timing_start();
+
+start = timing_counter_get();
+/* 要测量的代码 */
+my_function();
+end = timing_counter_get();
+
+cycles = timing_cycles_get(&start, &end);
+ns = timing_cycles_to_ns(cycles);
+printk("my_function took %llu ns\n", ns);
+
+timing_stop();
+```
+
+### 软件定时器
+
+```c
+/* 定义定时器回调 */
+void my_timer_cb(struct k_timer *timer)
+{
+    printk("Timer expired!\n");
+}
+
+K_TIMER_DEFINE(my_timer, my_timer_cb, NULL);
+
+/* 启动（延迟 1000ms，周期 2000ms）*/
+k_timer_start(&my_timer, K_MSEC(1000), K_MSEC(2000));
+
+/* 停止 */
+k_timer_stop(&my_timer);
+```
+
+### 栈使用率检查
+
+```
+CONFIG_INIT_STACKS=y        # 栈初始化为 0xAA
+CONFIG_THREAD_STACK_INFO=y  # 运行时获取栈使用
+```
+
+```c
+#include <zephyr/kernel.h>
+
+extern k_tid_t my_thread_id;
+
+void check_stack(void)
+{
+    struct k_thread *thread = (struct k_thread *)my_thread_id;
+    printk("Stack unused: %zu\n",
+           thread->stack_info.size -
+           thread->stack_info.used);
+}
+```
+
+### 生成 Bin / Hex / S19 文件
+
+```
+# west build 默认生成 .elf 和 .hex
+# 如果要额外格式：
+west build -b nucleo_f411re . -- -DCMAKE_VERBOSE_MAKEFILE=ON
+
+# 或者手动转换
+arm-zephyr-eabi-objcopy -O binary build/zephyr/zephyr.elf app.bin
+arm-zephyr-eabi-objcopy -O srec build/zephyr/zephyr.elf app.s19
+```
+
+### 查看已使能的功能概览
+
+```bash
+# 查看最终编译了哪些驱动
+grep "=y" build/zephyr/.config | grep "CONFIG_DRV"
+
+# 查看生成的中断向量表
+# build/zephyr/isr_tables.c
+
+# 查看链接器脚本
+# build/zephyr/linker.cmd
+```
+
+## 9.5 新手上路最容易掉的坑
+
+| 症状 | 大概率原因 | 检查 |
+|------|-----------|------|
+| 编译通过但不跑 | chosen 节点没有 console | `cat build/zephyr/zephyr.dts \| grep chosen` |
+| 一跑就 HardFault | 栈太小 | `kernel stacks` shell 命令 |
+| I2C 通信超时 | 没配时钟 | 检查时钟树/defconfig |
+| GPIO 没反应 | status = "okay"？ | 看看 build zephyr.dts |
+| shell 没输出 | 串口引脚错了 | 查 pinctrl 和原理图 |
+| 烧录提示找不到板子 | yaml identifier 名称不对 | 检查 boards/*.yaml |
+| 断电丢配置 | 没用 Settings | 加 Settings + NVS |
+| 线程莫名其妙不跑了 | 优先级不对/栈溢出 | `kernel threads` |
+| printf 没输出 | Zephyr 默认不用 printf | 改用 printk 或 LOG |
+
 ---
 
 > **最后记住：** Zephyr 的代码和文档本身是最好的学习资料。官方 sample 解决了 80% 的"第一步怎么做"的问题。剩下的 20% 是在具体报错时逐步调试查资料解决的。别怕读源码——源码才是最终真理。🦞
